@@ -17,7 +17,7 @@ A handheld Spotify controller using an ESP32-S3, a 1.28" round GC9A01 TFT displa
 * 3D printed chassis
 * USB cable for power and programming
 
-
+Printables link: https://www.printables.com/model/1770463-spotify-controller-chassy
 
 ## Physical Assembly
 
