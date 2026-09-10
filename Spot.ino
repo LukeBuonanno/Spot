@@ -1,4 +1,7 @@
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -11,19 +14,34 @@
 #include "warning.h"
 #include "stop.h"
 
-// ====== WiFi Info ======
-const char* ssid = "CHANGEME";
-const char* password = "CHANGEME";
+// ====== WiFi Configuration ======
+// Credentials are stored permanently in ESP32 NVS using Preferences.
+// The setup AP remains available while STA mode repeatedly attempts to connect.
+const char* SETUP_AP_SSID = "Spotify-Controller-Setup";
+const byte DNS_PORT = 53;
+IPAddress setupIP(192, 168, 4, 1);
+
+Preferences wifiPrefs;
+WebServer setupServer(80);
+DNSServer dnsServer;
+
+String savedSSID = "";
+String savedPassword = "";
+bool wifiAttemptInProgress = false;
+bool wifiWasConnected = false;
+bool portalStarted = false;
+unsigned long lastWifiRetry = 0;
+const unsigned long WIFI_RETRY_MS = 5000;
 
 // ====== Spotify ======
-String clientId = "CHANGEME";
-String clientSecret = "CHANGEME";
-String refreshToken = "CHANGEME";
-String accessToken = "";
+String clientId     = "changeme";
+String clientSecret = "changeme";
+String refreshToken = "changeme";
+String accessToken  = "";
 String activeDeviceId = "";
-bool isPaused = false;
-bool inMenu = false;
-int selectedIndex = 0;
+bool isPaused  = false;
+bool inMenu    = false;
+int  selectedIndex = 0;
 
 // ====== Spotify API ======
 const char* spotifyAPI = "https://api.spotify.com/v1";
@@ -34,28 +52,21 @@ const char* spotifyAPI = "https://api.spotify.com/v1";
 #define BTN_PV   6
 #define BTN_NV   7
 
-// Button state tracking
-unsigned long pressStartPV = 0, pressStartNV = 0, pressStartPlay = 0, pressStartMode = 0;
-bool pvHeld = false, nvHeld = false, playHeld = false, modeHeld = false;
-bool prevPVState = HIGH, prevNVState = HIGH, prevPlayState = HIGH, prevModeState = HIGH;
+bool prevPVState   = HIGH, prevNVState   = HIGH;
+bool prevPlayState = HIGH, prevModeState = HIGH;
 const unsigned long LONG_PRESS_MS = 600;
-const unsigned long DEBOUNCE_MS = 50;
-unsigned long lastPVAction = 0, lastNVAction = 0, lastPlayAction = 0, lastModeAction = 0;
-const unsigned long ACTION_GAP_MS = 10;
+const unsigned long DEBOUNCE_MS   = 50;
+unsigned long lastPVAction = 0, lastNVAction = 0;
+unsigned long lastPlayAction = 0, lastModeAction = 0;
 
 // ====== Playlist ======
-int playlistIndex = 0;
-
-struct Playlist {
-  String name;
-  String uri;
-};
-
+struct Playlist { String name; String uri; };
 Playlist playlists[] = {
-{"CHANGEME",       "spotify:playlist:CHANGEME"},
-{"CHANGEME",       "spotify:playlist:CHANGEME"},
-{"CHANGEME",       "spotify:playlist:CHANGEME"},
-{"CHANGEME",       "spotify:playlist:CHANGEME"}
+{"changeme (name)",      "spotify:playlist:changeme"},
+{"changeme (name)",      "spotify:playlist:changeme"},
+{"changeme (name)",      "spotify:playlist:changeme"},
+{"changeme (name)",      "spotify:playlist:changemeETC"}
+
 };
 const int NUM_PLAYLISTS = sizeof(playlists) / sizeof(playlists[0]);
 
@@ -67,130 +78,336 @@ const int NUM_PLAYLISTS = sizeof(playlists) / sizeof(playlists[0]);
 #define TFT_RST  13
 Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
-// ====== Font safety helper ======
-// Always call this before any text/draw operation that might run after a
-// fillScreen() or display re-init, both of which silently clear the font ptr.
 inline void resetFont() {
   tft.setFont(&micross7pt7b);
   tft.setTextSize(1);
 }
 
 // ====== Win98 Color Palette ======
-#define WIN98_BG      0xC618  // #C0C0C0 silver
-#define WIN98_GRAY    0x9CF3  // slightly darker gray
-#define WIN98_DKGRAY  0x7BEF  // dark gray
-#define WIN98_WHITE   0xFFFF
-#define WIN98_BLACK   0x0000
-#define WIN98_BLUE    0x001F  // classic Win98 title bar blue (adjust as desired)
-#define WIN98_TEXT    0x0000
-#define WIN98_BORDER  0xFFFF
-#define WIN98_SHADOW  0x7BEF
+#define WIN98_BG     0xC618
+#define WIN98_GRAY   0x9CF3
+#define WIN98_DKGRAY 0x7BEF
+#define WIN98_WHITE  0xFFFF
+#define WIN98_BLACK  0x0000
+#define WIN98_BLUE   0x001F
+#define WIN98_TEXT   0x0000
+#define WIN98_BORDER 0xFFFF
+#define WIN98_SHADOW 0x7BEF
+
+// ====== Window Geometry (shared constants) ======
+// Keeping these as constants avoids recomputing them every draw call.
+const int WIN_MARGIN   = 36;
+const int WIN_TITLEBAR = 24;
+const int WIN_X = WIN_MARGIN;
+const int WIN_Y = WIN_MARGIN;
+const int WIN_W = 240 - WIN_MARGIN * 2;   // 168
+const int WIN_H = 240 - WIN_MARGIN * 2;   // 168
+
+// ====== App State Machine ======
+// These states gate both what runs in loop() AND what gets drawn to the screen.
+// The screen only redraws when appState actually changes.
+enum AppState {
+  APP_WIFI_CONNECTING,  // STA is trying to reach the saved WiFi network
+  APP_SPOTIFY_INIT,     // WiFi is up — getting token + devices
+  APP_RUNNING           // fully operational, normal Spotify UI
+};
+AppState appState          = APP_WIFI_CONNECTING;
+AppState lastDrawnAppState = (AppState)(-1);  // sentinel — forces first status draw
+
+unsigned long lastSpotifyRetry = 0;
+const unsigned long SPOTIFY_RETRY_MS = 5000;
 
 // ====== Now Playing ======
 struct NowPlaying {
-  String track;
-  String artist;
-  unsigned long progress_ms;
-  unsigned long duration_ms;
+  String track, artist;
+  unsigned long progress_ms, duration_ms;
   bool isPlaying;
 };
 NowPlaying nowPlaying;
 
-// Track last displayed text
-String lastTrack = "";
+String lastTrack  = "";
 String lastArtist = "";
 unsigned long lastDuration = 0;
 unsigned long lastProgress = 0;
 
-// ====== Device State ======
-bool deviceActive = false;
-bool brokenLinkDrawn = false;
-bool firstNowPlayingDraw = true;   // reset whenever we leave the menu
-unsigned long lastDeviceAttempt = 0;
+// ====== Device / display state ======
+bool deviceActive        = false;
+bool brokenLinkDrawn     = false;
+bool firstNowPlayingDraw = true;
+unsigned long lastDeviceAttempt  = 0;
 const unsigned long deviceRetryInterval = 5000;
 
-// ====== Portal Credentials ======
-const char* portalUser = "CHANGEME";
-const char* portalPass = "CHANGEME";
-
 // ====== Timing ======
-unsigned long lastNowPlaying = 0;
+unsigned long lastNowPlaying    = 0;
 const unsigned long nowPlayingInterval = 2000;
 unsigned long lastDisplayUpdate = 0;
-const unsigned long displayInterval = 150;
-unsigned long lastTokenRefresh = 0;
+const unsigned long displayInterval    = 150;
+unsigned long lastTokenRefresh  = 0;
 const unsigned long TOKEN_REFRESH_INTERVAL = 3500UL * 1000;
 
 // ====== Display Constants ======
-const int16_t DISP_W = 240;
-const int16_t DISP_H = 240;
-const int16_t BASE_TITLE_Y = 60;
+const int16_t DISP_W       = 240;
+const int16_t DISP_H       = 240;
+const int16_t BASE_TITLE_Y  = 60;
 const int16_t BASE_ARTIST_Y = 90;
-const int16_t PROGRESS_H = 8;
-int16_t progressBarX = 45;
-int16_t progressBarW = DISP_W - (progressBarX * 2);
 
 // ====== Forward Declarations ======
-bool refreshAccessToken();
-void fetchDevices();
-void fetchNowPlaying();
-void togglePlayPause();
-void nextTrack();
-void previousTrack();
-void playPlaylist(String uri);
-void checkButtons(unsigned long now);
-void displayNowPlaying(bool forceBG, bool forceGUI);
-void drawPlaylistMenu(bool fullRedraw, int prevIndex, int newIndex);
-void drawWin98WindowFrame(const char* title);
-void drawWin98CloudsBG();
-void drawBrokenLink(int16_t x, int16_t y);
-void drawWin98ProgressBar(unsigned long progress, unsigned long total, int y);
-void drawCenteredText(int16_t cx, int16_t cy, const char* text, uint16_t color, uint16_t bgColor);
-void drawCenteredTextBlock(int16_t cx, int16_t cy, const char* text, uint16_t color, uint16_t bgColor);
-void draw3DBorder(int x, int y, int w, int h);
-void drawWin98Button(int x, int y, int w, int h, const char* label, bool pressed);
-void drawWin98ButtonEx(int x, int y, int w, int h, const char* label, uint16_t bg, uint16_t textCol, bool pressed);
+bool   refreshAccessToken();
+void   fetchDevices();
+void   fetchNowPlaying();
+void   togglePlayPause();
+void   nextTrack();
+void   previousTrack();
+void   playPlaylist(String uri);
+void   checkButtons(unsigned long now);
+void   displayNowPlaying(bool forceBG, bool forceGUI);
+void   drawPlaylistMenu(bool fullRedraw, int prevIndex, int newIndex);
+void   drawWin98WindowFrame(const char* title);
+void   drawWin98CloudsBG();
+void   drawBrokenLink(int16_t x, int16_t y);
+void   drawWin98ProgressBar(unsigned long progress, unsigned long total, int y);
+void   drawStatusWindow(const char* title, const char* line1, const char* line2 = "");
+void   drawCenteredText(int16_t cx, int16_t cy, const char* text, uint16_t color, uint16_t bgColor);
+void   drawCenteredTextBlock(int16_t cx, int16_t cy, const char* text, uint16_t color, uint16_t bgColor);
+void   draw3DBorder(int x, int y, int w, int h);
+void   drawWin98Button(int x, int y, int w, int h, const char* label, bool pressed = false);
+void   drawWin98ButtonEx(int x, int y, int w, int h, const char* label, uint16_t bg, uint16_t textCol, bool pressed = false);
 String trimString(const String& str);
 int16_t getTextWidth(const String& text);
 int16_t getTextHeight();
 std::vector<String> wrapText(String text, int maxChars);
-bool authenticateCaptivePortal();
+void loadWiFiCredentials();
+void saveWiFiCredentials(const String& ssid, const String& password);
+void startWiFiSetupPortal();
+void handleWiFiSetupPortal();
+void attemptWiFiConnection();
+void handleWiFiConnection();
+void setupPortalRoot();
+void setupPortalSave();
+void setupPortalNotFound();
 
-// ====== Captive Portal ======
-bool authenticateCaptivePortal() {
-  HTTPClient h1;
-  h1.begin("CHANGEME");
-  h1.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  const char* keys[] = {"Location"};
-  h1.collectHeaders(keys, 1);
-  h1.GET();
-  String portalURL = h1.header("Location");
-  h1.end();
+// ====== Status Window ======
+// Draw a Win98 window with one or two lines of centered status text.
+// Touches only the window area — clouds behind it are never disturbed.
+// Call this ONCE when entering a new state; it will NOT be called again
+// until appState changes (enforced by the lastDrawnAppState guard in loop).
+void drawStatusWindow(const char* title, const char* line1, const char* line2) {
+  resetFont();
+  drawWin98WindowFrame(title);  // fills WIN98_BG inside the window automatically
+  if (strlen(line1) > 0)
+    drawCenteredText(DISP_W / 2, DISP_H / 2 - 12, line1, WIN98_TEXT,   WIN98_BG);
+  if (strlen(line2) > 0)
+    drawCenteredText(DISP_W / 2, DISP_H / 2 + 10, line2, WIN98_DKGRAY, WIN98_BG);
+}
 
-  Serial.println("UniFi URL: " + portalURL);
-  if (portalURL.length() == 0) {
-    Serial.println("No redirect — may already be authenticated");
-    return true;
+// ====== WiFi Setup Captive Portal ======
+String htmlEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 16);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') out += F("&amp;");
+    else if (c == '<') out += F("&lt;");
+    else if (c == '>') out += F("&gt;");
+    else if (c == '"') out += F("&quot;");
+    else out += c;
+  }
+  return out;
+}
+
+void loadWiFiCredentials() {
+  wifiPrefs.begin("wifi", true);
+  savedSSID = wifiPrefs.getString("ssid", "");
+  savedPassword = wifiPrefs.getString("password", "");
+  wifiPrefs.end();
+
+  Serial.println("Stored WiFi SSID: " + (savedSSID.length() ? savedSSID : String("<none>")));
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("password", password);
+  wifiPrefs.end();
+
+  savedSSID = ssid;
+  savedPassword = password;
+  Serial.println("Saved WiFi credentials for: " + savedSSID);
+}
+
+void setupPortalRoot() {
+  String page = F(R"HTML(
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Controller WiFi</title>
+<style>
+body{font-family:Arial,sans-serif;background:#c0c0c0;margin:0;padding:20px;color:#000}
+.window{max-width:420px;margin:20px auto;background:#c0c0c0;border:2px solid #fff;box-shadow:2px 2px #000}
+.title{background:#000080;color:#fff;font-weight:bold;padding:8px}
+.content{padding:18px}
+label{display:block;margin:12px 0 5px;font-weight:bold}
+input{box-sizing:border-box;width:100%;padding:10px;border:2px inset #fff;background:#fff}
+button{margin-top:18px;padding:10px 18px;font-weight:bold}
+.status{padding:10px;background:#eee;border:1px solid #777;margin-bottom:14px}
+.small{font-size:13px;color:#333}
+</style>
+</head>
+<body>
+<div class="window">
+<div class="title">Spotify Controller - WiFi Setup</div>
+<div class="content">
+<div class="status">The controller will keep trying to connect to WiFi in the background. This setup page stays available while it does so.</div>
+<form method="POST" action="/save">
+<label for="ssid">WiFi network (SSID)</label>
+<input id="ssid" name="ssid" type="text" maxlength="64" required value=")HTML");
+  page += htmlEscape(savedSSID);
+  page += F(R"HTML(">
+<label for="password">WiFi password</label>
+<input id="password" name="password" type="password" maxlength="128" value=")HTML");
+  page += htmlEscape(savedPassword);
+  page += F(R"HTML(">
+<button type="submit">Save and connect</button>
+</form>
+<p class="small">Setup address: 192.168.4.1</p>
+</div>
+</div>
+</body>
+</html>
+)HTML");
+
+  setupServer.send(200, "text/html", page);
+}
+
+void setupPortalSave() {
+  String ssid = setupServer.arg("ssid");
+  String password = setupServer.arg("password");
+  ssid.trim();
+
+  if (ssid.length() == 0) {
+    setupServer.send(400, "text/plain", "SSID cannot be empty.");
+    return;
   }
 
-  WiFiClientSecure sc;
-  sc.setInsecure();
-  HTTPClient h2;
-  h2.begin(sc, portalURL);
-  h2.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  h2.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  h2.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-  h2.addHeader("Referer", portalURL);
+  saveWiFiCredentials(ssid, password);
 
-  String body = String("username=") + portalUser + "&password=" + portalPass;
-  int code = h2.POST(body);
-  Serial.printf("UniFi POST code: %d\n", code);
-  h2.end();
+  setupServer.send(200, "text/html", R"HTML(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Saved</title></head><body style="font-family:Arial;padding:25px">
+<h2>WiFi saved</h2><p>The ESP32 is now trying to connect to the new network.</p>
+<p>You can leave this page open. The setup portal will remain available.</p>
+</body></html>)HTML");
 
-  return (code == 200 || code == 302);
+  // Start a fresh STA connection without erasing the newly saved credentials.
+  wifiWasConnected = false;
+  wifiAttemptInProgress = false;
+  WiFi.disconnect(false, false);
+  delay(50);
+  attemptWiFiConnection();
+}
+
+void setupPortalNotFound() {
+  // Captive portal behavior: send unknown URLs back to the configuration page.
+  setupServer.sendHeader("Location", String("http://") + setupIP.toString(), true);
+  setupServer.send(302, "text/plain", "Redirecting to WiFi setup...");
+}
+
+void startWiFiSetupPortal() {
+  if (portalStarted) return;
+
+  // AP+STA lets the ESP32 host the setup page while simultaneously trying WiFi.
+  // The AP is stopped automatically once the STA connection succeeds.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(setupIP, setupIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(SETUP_AP_SSID);
+
+  dnsServer.start(DNS_PORT, "*", setupIP);
+
+  setupServer.on("/", HTTP_GET, setupPortalRoot);
+  setupServer.on("/save", HTTP_POST, setupPortalSave);
+
+  // Common captive-portal probe URLs used by phones/computers.
+  setupServer.on("/generate_204", HTTP_ANY, setupPortalRoot);
+  setupServer.on("/hotspot-detect.html", HTTP_ANY, setupPortalRoot);
+  setupServer.on("/connecttest.txt", HTTP_ANY, setupPortalRoot);
+  setupServer.on("/ncsi.txt", HTTP_ANY, setupPortalRoot);
+  setupServer.onNotFound(setupPortalNotFound);
+  setupServer.begin();
+
+  portalStarted = true;
+
+  Serial.println("WiFi setup AP started: " + String(SETUP_AP_SSID));
+  Serial.println("Connect to it and open http://192.168.4.1/");
+}
+
+void handleWiFiSetupPortal() {
+  if (!portalStarted) return;
+  dnsServer.processNextRequest();
+  setupServer.handleClient();
+}
+
+void stopWiFiSetupPortal() {
+  if (!portalStarted) return;
+
+  Serial.println("WiFi connected. Stopping setup portal.");
+
+  dnsServer.stop();
+  setupServer.stop();
+  WiFi.softAPdisconnect(true);
+
+  // Leave the ESP32 in normal station mode now that configuration is complete.
+  WiFi.mode(WIFI_STA);
+  portalStarted = false;
+}
+
+void attemptWiFiConnection() {
+  if (savedSSID.length() == 0) {
+    Serial.println("No saved WiFi credentials. Waiting for setup portal.");
+    return;
+  }
+
+  Serial.println("Trying WiFi: " + savedSSID);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+  wifiAttemptInProgress = true;
+  lastWifiRetry = millis();
+}
+
+void handleWiFiConnection() {
+  unsigned long now = millis();
+  wl_status_t status = WiFi.status();
+
+  if (status == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      wifiAttemptInProgress = false;
+      Serial.println("WiFi connected: " + WiFi.localIP().toString());
+      stopWiFiSetupPortal();
+      appState = APP_SPOTIFY_INIT;
+      lastSpotifyRetry = 0;
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    Serial.println("WiFi connection lost. Restarting setup portal and retrying.");
+    wifiWasConnected = false;
+    wifiAttemptInProgress = false;
+    appState = APP_WIFI_CONNECTING;
+    lastDrawnAppState = (AppState)(-1);
+    startWiFiSetupPortal();
+  }
+
+  if (!wifiAttemptInProgress || now - lastWifiRetry >= WIFI_RETRY_MS) {
+    // Do NOT erase stored credentials. WiFi can simply be down temporarily.
+    attemptWiFiConnection();
+  }
 }
 
 // ====== Setup ======
+// Initialise display first so we can show status immediately, then kick off
+// WiFi non-blocking.  Everything else is handled by the state machine in loop().
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -200,49 +417,100 @@ void setup() {
   pinMode(BTN_PV,   INPUT_PULLUP);
   pinMode(BTN_NV,   INPUT_PULLUP);
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.println("Authenticating portal...");
-  if (authenticateCaptivePortal()) {
-    Serial.println("Portal OK");
-  } else {
-    Serial.println("Portal failed — Spotify may not work");
-  }
-  delay(1000);
-
-  Serial.println("Refreshing token...");
-  if (refreshAccessToken()) {
-    lastTokenRefresh = millis();
-    Serial.println("Fetching devices...");
-    fetchDevices();
-  }
-
+  // ── Display first ──────────────────────────────────────────────────────
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(0x0000);
-  tft.setFont(&micross7pt7b);
-  tft.setTextSize(1);
-  drawWin98CloudsBG();
+  resetFont();
+  drawWin98CloudsBG();   // ← THE ONLY PLACE THIS IS EVER CALLED
+                         //   Clouds are permanent wallpaper; never redrawn.
+
+  // ── WiFi setup / connection ───────────────────────────────────────────
+  loadWiFiCredentials();
+  startWiFiSetupPortal();
+  attemptWiFiConnection();
+  // loop() handles retries and the captive portal without blocking.
 }
 
 // ====== Loop ======
 void loop() {
   unsigned long now = millis();
 
-  // Periodic token refresh
+  // ════════════════════════════════════════════════════════════════════════
+  // WiFi setup portal + background connection state machine
+  // The portal is serviced while STA mode is disconnected/reconnecting.
+  // Once WiFi connects, the portal/AP is shut down automatically.
+  // ════════════════════════════════════════════════════════════════════════
+  handleWiFiSetupPortal();
+  handleWiFiConnection();
+
+  switch (appState) {
+    case APP_WIFI_CONNECTING: {
+      if (lastDrawnAppState != appState) {
+        drawStatusWindow("WiFi",
+                         savedSSID.length() ? savedSSID.c_str() : "No WiFi saved",
+                         "Wifi: Spotify-Controller");
+        lastDrawnAppState = appState;
+      }
+      return;
+    }
+
+    case APP_SPOTIFY_INIT: {
+      if (lastDrawnAppState != appState) {
+        drawStatusWindow("Connecting...", "Spotify...", "");
+        lastDrawnAppState = appState;
+        lastSpotifyRetry = 0;
+      }
+
+      if (WiFi.status() != WL_CONNECTED) {
+        appState = APP_WIFI_CONNECTING;
+        lastDrawnAppState = (AppState)(-1);
+        return;
+      }
+
+      if (now - lastSpotifyRetry >= SPOTIFY_RETRY_MS) {
+        lastSpotifyRetry = now;
+        if (refreshAccessToken()) {
+          lastTokenRefresh = now;
+
+          // Get the device and current playback state before entering the
+          // normal UI. This prevents the first frame from being drawn with
+          // an empty nowPlaying object and then immediately being replaced.
+          fetchDevices();
+          if (deviceActive) {
+            fetchNowPlaying();
+            lastNowPlaying = now;
+          }
+
+          appState = APP_RUNNING;
+          lastDrawnAppState = (AppState)(-1);
+          firstNowPlayingDraw = true;
+        }
+      }
+      return;
+    }
+
+    case APP_RUNNING:
+    default:
+      break;
+  }
+
+  // ── WiFi watchdog while running ─────────────────────────────────────────
+  // handleWiFiConnection() above starts retries and enables the setup
+  // AP again if the network disappears.
+  if (WiFi.status() != WL_CONNECTED) {
+    appState = APP_WIFI_CONNECTING;
+    lastDrawnAppState = (AppState)(-1);
+    deviceActive = false;
+    return;
+  }
+
+  // ── Periodic token refresh ──────────────────────────────────────────────
   if (now - lastTokenRefresh > TOKEN_REFRESH_INTERVAL) {
     if (refreshAccessToken()) lastTokenRefresh = now;
   }
 
-  // Retry device lookup if none active
+  // ── Device heartbeat ────────────────────────────────────────────────────
   if (!deviceActive && now - lastDeviceAttempt > deviceRetryInterval) {
     fetchDevices();
     lastDeviceAttempt = now;
@@ -256,21 +524,18 @@ void loop() {
 
   checkButtons(now);
 
+  // ── Now Playing refresh + display ───────────────────────────────────────
   if (deviceActive && !inMenu) {
     if (now - lastNowPlaying > nowPlayingInterval) {
       fetchNowPlaying();
       lastNowPlaying = now;
     }
-
-    static bool _unused = false;  // placeholder, firstNowPlayingDraw is now global
     if (now - lastDisplayUpdate > displayInterval) {
       if (firstNowPlayingDraw) {
         displayNowPlaying(true, true);
         firstNowPlayingDraw = false;
-        brokenLinkDrawn = false;
       } else {
         displayNowPlaying(false, false);
-        brokenLinkDrawn = false;
       }
       lastDisplayUpdate = now;
     }
@@ -282,34 +547,28 @@ bool refreshAccessToken() {
   HTTPClient http;
   http.begin("https://accounts.spotify.com/api/token");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
   String body = "grant_type=refresh_token&refresh_token=" + refreshToken +
                 "&client_id=" + clientId + "&client_secret=" + clientSecret;
-
   int code = http.POST(body);
   if (code == 200) {
-    String payload = http.getString();
     DynamicJsonDocument doc(1024);
-    deserializeJson(doc, payload);
+    deserializeJson(doc, http.getString());
     accessToken = doc["access_token"].as<String>();
     Serial.println("New access token acquired!");
     http.end();
     return true;
-  } else {
-    Serial.printf("Token refresh failed: %d\nResponse: %s\n", code, http.getString().c_str());
-    http.end();
-    return false;
   }
+  Serial.printf("Token refresh failed: %d\n", code);
+  http.end();
+  return false;
 }
 
 void fetchDevices() {
   if (accessToken == "") return;
-
   HTTPClient http;
   http.begin(String(spotifyAPI) + "/me/player/devices");
   http.addHeader("Authorization", "Bearer " + accessToken);
   int code = http.GET();
-
   bool found = false;
   if (code == 200) {
     DynamicJsonDocument doc(8192);
@@ -331,21 +590,19 @@ void fetchDevices() {
 
 void fetchNowPlaying() {
   if (activeDeviceId == "") return;
-
   HTTPClient http;
   http.begin(String(spotifyAPI) + "/me/player/currently-playing");
   http.addHeader("Authorization", "Bearer " + accessToken);
   int code = http.GET();
-
   if (code == 200) {
     DynamicJsonDocument doc(8192);
     deserializeJson(doc, http.getString());
     if (doc.containsKey("item")) {
-      nowPlaying.track      = String((const char*)doc["item"]["name"]);
-      nowPlaying.artist     = String((const char*)doc["item"]["artists"][0]["name"]);
+      nowPlaying.track       = String((const char*)doc["item"]["name"]);
+      nowPlaying.artist      = String((const char*)doc["item"]["artists"][0]["name"]);
       nowPlaying.progress_ms = doc["progress_ms"];
       nowPlaying.duration_ms = doc["item"]["duration_ms"];
-      nowPlaying.isPlaying  = doc["is_playing"];
+      nowPlaying.isPlaying   = doc["is_playing"];
     }
   } else if (code == 204) {
     nowPlaying.track       = "-";
@@ -375,8 +632,7 @@ void togglePlayPause() {
 void nextTrack() {
   if (activeDeviceId == "") return;
   HTTPClient http;
-  String url = String(spotifyAPI) + "/me/player/next?device_id=" + activeDeviceId;
-  http.begin(url);
+  http.begin(String(spotifyAPI) + "/me/player/next?device_id=" + activeDeviceId);
   http.addHeader("Authorization", "Bearer " + accessToken);
   http.addHeader("Content-Length", "0");
   http.POST("");
@@ -386,8 +642,7 @@ void nextTrack() {
 void previousTrack() {
   if (activeDeviceId == "") return;
   HTTPClient http;
-  String url = String(spotifyAPI) + "/me/player/previous?device_id=" + activeDeviceId;
-  http.begin(url);
+  http.begin(String(spotifyAPI) + "/me/player/previous?device_id=" + activeDeviceId);
   http.addHeader("Authorization", "Bearer " + accessToken);
   http.addHeader("Content-Length", "0");
   http.POST("");
@@ -397,12 +652,10 @@ void previousTrack() {
 void playPlaylist(String uri) {
   if (activeDeviceId == "") return;
   HTTPClient http;
-  String url = String(spotifyAPI) + "/me/player/play?device_id=" + activeDeviceId;
-  http.begin(url);
+  http.begin(String(spotifyAPI) + "/me/player/play?device_id=" + activeDeviceId);
   http.addHeader("Authorization", "Bearer " + accessToken);
   http.addHeader("Content-Type", "application/json");
-  String body = "{\"context_uri\":\"" + uri + "\"}";
-  http.PUT(body);
+  http.PUT("{\"context_uri\":\"" + uri + "\"}");
   http.end();
 }
 
@@ -417,15 +670,13 @@ String trimString(const String& str) {
 }
 
 int16_t getTextWidth(const String& text) {
-  int16_t x1, y1;
-  uint16_t w, h;
+  int16_t x1, y1; uint16_t w, h;
   tft.getTextBounds(text.c_str(), 0, 0, &x1, &y1, &w, &h);
   return w;
 }
 
 int16_t getTextHeight() {
-  int16_t x1, y1;
-  uint16_t w, h;
+  int16_t x1, y1; uint16_t w, h;
   tft.getTextBounds("Hg", 0, 0, &x1, &y1, &w, &h);
   return h;
 }
@@ -447,55 +698,43 @@ std::vector<String> wrapText(String text, int maxChars) {
 // ====== Draw Helpers ======
 void drawCenteredText(int16_t cx, int16_t cy, const char* text,
                       uint16_t color = WIN98_TEXT, uint16_t bgColor = WIN98_BG) {
-  String t(text);
-  t = trimString(t);
-  int16_t x1, y1;
-  uint16_t w, h;
+  String t = trimString(String(text));
+  int16_t x1, y1; uint16_t w, h;
   tft.getTextBounds(t.c_str(), 0, 0, &x1, &y1, &w, &h);
-  int16_t x = cx - w / 2;
-  int16_t y = cy + h / 2 - y1;
-  tft.setCursor(x, y);
+  tft.setCursor(cx - w / 2, cy + h / 2 - y1);
   tft.setTextColor(color, bgColor);
   tft.print(t);
 }
 
 void drawCenteredTextBlock(int16_t cx, int16_t cy, const char* text,
                            uint16_t color = WIN98_TEXT, uint16_t bgColor = WIN98_BG) {
-  String content(text);
-  std::vector<String> lines = wrapText(content, 16);
-  int16_t lineHeight = getTextHeight();
+  std::vector<String> lines = wrapText(String(text), 16);
+  int16_t lineHeight  = getTextHeight();
   int16_t blockHeight = lines.size() * lineHeight;
-  int16_t startY = cy - (blockHeight / 2);
+  int16_t startY      = cy - (blockHeight / 2);
   for (size_t i = 0; i < lines.size(); i++) {
     int16_t w = getTextWidth(lines[i]);
-    int16_t x = cx - (w / 2);
-    int16_t y = startY + i * lineHeight + lineHeight;
-    tft.setCursor(x, y);
+    tft.setCursor(cx - (w / 2), startY + i * lineHeight + lineHeight);
     tft.setTextColor(color, bgColor);
     tft.print(lines[i]);
   }
 }
 
 void draw3DBorder(int x, int y, int w, int h) {
-  tft.drawRect(x, y, w, h, WIN98_DKGRAY);
+  tft.drawRect(x,     y,     w,     h,     WIN98_DKGRAY);
   tft.drawRect(x + 1, y + 1, w - 2, h - 2, WIN98_WHITE);
 }
 
-// Single declaration of drawWin98Button with default arg
-void drawWin98Button(int x, int y, int w, int h, const char* label, bool pressed = false) {
+void drawWin98Button(int x, int y, int w, int h, const char* label, bool pressed) {
   uint16_t topLeft     = pressed ? WIN98_SHADOW : WIN98_BORDER;
   uint16_t bottomRight = pressed ? WIN98_BORDER : WIN98_SHADOW;
-
   tft.fillRect(x, y, w, h, WIN98_BG);
   tft.drawLine(x,         y,         x + w - 1, y,         topLeft);
   tft.drawLine(x,         y,         x,         y + h - 1, topLeft);
   tft.drawLine(x,         y + h - 1, x + w - 1, y + h - 1, bottomRight);
   tft.drawLine(x + w - 1, y,         x + w - 1, y + h - 1, bottomRight);
-
   if (strlen(label) == 0) return;
-  // Use raw bounds to precisely center text inside button
-  int16_t x1, y1;
-  uint16_t tw, th;
+  int16_t x1, y1; uint16_t tw, th;
   tft.getTextBounds(label, 0, 0, &x1, &y1, &tw, &th);
   tft.setCursor((x + w/2) - tw/2 - x1, (y + h/2) - th/2 - y1);
   tft.setTextColor(WIN98_TEXT, WIN98_BG);
@@ -503,45 +742,35 @@ void drawWin98Button(int x, int y, int w, int h, const char* label, bool pressed
 }
 
 void drawWin98ButtonEx(int x, int y, int w, int h,
-                       const char* label, uint16_t bg, uint16_t textCol, bool pressed = false) {
+                       const char* label, uint16_t bg, uint16_t textCol, bool pressed) {
   uint16_t topLeft     = pressed ? WIN98_SHADOW : WIN98_BORDER;
   uint16_t bottomRight = pressed ? WIN98_BORDER : WIN98_SHADOW;
-
   tft.fillRect(x, y, w, h, bg);
   tft.drawLine(x,         y,         x + w - 1, y,         topLeft);
   tft.drawLine(x,         y,         x,         y + h - 1, topLeft);
   tft.drawLine(x,         y + h - 1, x + w - 1, y + h - 1, bottomRight);
   tft.drawLine(x + w - 1, y,         x + w - 1, y + h - 1, bottomRight);
-
-  int16_t bx, by;
-  uint16_t bw, bh;
+  int16_t bx, by; uint16_t bw, bh;
   tft.getTextBounds(label, 0, 0, &bx, &by, &bw, &bh);
-  int cx = x + w / 2;
-  int cy = y + h / 2;
-  int textY = cy + by - 3;
-
-  drawCenteredText(cx, textY, label, textCol, bg);
+  drawCenteredText(x + w / 2, y + h / 2 + by - 3, label, textCol, bg);
 }
 
+// Draws a Win98 window frame and fills the interior with WIN98_BG.
+// The surrounding display (clouds wallpaper) is NEVER touched by this function.
 void drawWin98WindowFrame(const char* title) {
   resetFont();
-  int margin = 36;
-  int winX = margin, winY = margin;
-  int winW = DISP_W - margin * 2;
-  int winH = DISP_H - margin * 2;
+  tft.fillRect(WIN_X, WIN_Y, WIN_W, WIN_H, WIN98_BG);
 
-  tft.fillRect(winX, winY, winW, winH, WIN98_BG);
-
-  int titleBarH = 24;
-  tft.fillRect(winX, winY, winW, titleBarH, WIN98_BLUE);
+  // Title bar
+  tft.fillRect(WIN_X, WIN_Y, WIN_W, WIN_TITLEBAR, WIN98_BLUE);
   tft.setTextColor(WIN98_WHITE, WIN98_BLUE);
-  tft.setCursor(winX + 6, winY + titleBarH - 6);
+  tft.setCursor(WIN_X + 6, WIN_Y + WIN_TITLEBAR - 6);
   tft.print(title);
 
+  // Title-bar buttons
   int btnSize = 16;
-  int btnY = winY + 4;
-  int btnX = winX + winW - (btnSize + 4);
-
+  int btnY    = WIN_Y + 4;
+  int btnX    = WIN_X + WIN_W - (btnSize + 4);
   drawWin98Button(btnX, btnY, btnSize, btnSize, "X");
   btnX -= (btnSize + 3);
   drawWin98Button(btnX, btnY, btnSize, btnSize, "");
@@ -549,11 +778,12 @@ void drawWin98WindowFrame(const char* title) {
   btnX -= (btnSize + 3);
   drawWin98Button(btnX, btnY, btnSize, btnSize, "_");
 
-  draw3DBorder(winX, winY, winW, winH);
+  draw3DBorder(WIN_X, WIN_Y, WIN_W, WIN_H);
 }
 
+// Called ONCE from setup() — paints the cloud wallpaper permanently.
+// Do NOT call this anywhere else; it wipes and repaints the full 240×240 display.
 void drawWin98CloudsBG() {
-  brokenLinkDrawn = false;
   tft.fillScreen(0x0000);
   resetFont();
   tft.drawRGBBitmap(
@@ -563,7 +793,9 @@ void drawWin98CloudsBG() {
     RSZ_11WINDOWS_98_CLOUDS_1__HEIGHT);
 }
 
-void drawBrokenLink(int16_t x, int16_t y) {
+// Draw the "broken link / error" dialog — works the same as any other window,
+// just fills the window area without touching clouds.
+void drawBrokenLink(int16_t /*x*/, int16_t /*y*/) {
   resetFont();
   drawWin98WindowFrame("Error!");
   tft.drawRGBBitmap(80, 74, warning, WARNING_HEIGHT, WARNING_WIDTH);
@@ -571,7 +803,7 @@ void drawBrokenLink(int16_t x, int16_t y) {
   brokenLinkDrawn = true;
 }
 
-// Call this once when entering Now Playing to reset segment state
+// ====== Progress Bar ======
 static int lastSegCount = -1;
 inline void resetProgressBar() { lastSegCount = -1; }
 
@@ -580,23 +812,19 @@ void drawWin98ProgressBar(unsigned long progress, unsigned long total, int y) {
   const int barW = DISP_W - 86;
   const int barH = 22;
 
-  // Only draw the sunken border + grey bg on a full redraw (lastSegCount == -1)
+  // Draw sunken border + grey bg only on a full redraw
   if (lastSegCount == -1) {
-    // Outer sunken border
-    tft.drawFastHLine(barX,             y,           barW, WIN98_DKGRAY);
-    tft.drawFastVLine(barX,             y,           barH, WIN98_DKGRAY);
-    tft.drawFastHLine(barX,             y + barH - 1, barW, WIN98_WHITE);
-    tft.drawFastVLine(barX + barW - 1,  y,           barH, WIN98_WHITE);
-    // Inner shadow
-    tft.drawFastHLine(barX + 1,         y + 1,           barW - 2, WIN98_BLACK);
-    tft.drawFastVLine(barX + 1,         y + 1,           barH - 2, WIN98_BLACK);
-    tft.drawFastHLine(barX + 1,         y + barH - 2, barW - 2, WIN98_GRAY);
-    tft.drawFastVLine(barX + barW - 2,  y + 1,           barH - 2, WIN98_GRAY);
-    // Grey fill (not white)
+    tft.drawFastHLine(barX,            y,           barW, WIN98_DKGRAY);
+    tft.drawFastVLine(barX,            y,           barH, WIN98_DKGRAY);
+    tft.drawFastHLine(barX,            y + barH - 1, barW, WIN98_WHITE);
+    tft.drawFastVLine(barX + barW - 1, y,           barH, WIN98_WHITE);
+    tft.drawFastHLine(barX + 1,        y + 1,           barW - 2, WIN98_BLACK);
+    tft.drawFastVLine(barX + 1,        y + 1,           barH - 2, WIN98_BLACK);
+    tft.drawFastHLine(barX + 1,        y + barH - 2, barW - 2, WIN98_GRAY);
+    tft.drawFastVLine(barX + barW - 2, y + 1,           barH - 2, WIN98_GRAY);
     tft.fillRect(barX + 2, y + 2, barW - 4, barH - 4, WIN98_BG);
   }
 
-  // --- Incremental segments only ---
   const int segW    = 8;
   const int segGap  = 2;
   const int segUnit = segW + segGap;
@@ -604,36 +832,28 @@ void drawWin98ProgressBar(unsigned long progress, unsigned long total, int y) {
   const int innerY  = y + 2;
   const int innerW  = barW - 4;
   const int innerH  = barH - 4;
-   const int zoneX = innerX + segGap;          // left edge with gap
-  const int zoneY = innerY + segGap;          // top edge with gap
-  const int zoneW = innerW - (segGap * 2);    // right gap already subtracted
-  const int zoneH = innerH - (segGap * 2);    // bottom gap already subtracted
- int maxSegs = (zoneW + segGap) / segUnit;
-  int fillW   = (total > 0) ? (int)((float)progress / total * (float)zoneW) : 0;
-  int numSegs = min((int)((fillW + segGap) / segUnit), maxSegs);
-    int blockW     = maxSegs * segUnit - segGap;
-  int extraX     = (zoneW - blockW) / 2;      // distribute leftover equally
-  int segStartX  = zoneX ;
-
+  const int zoneX   = innerX + segGap;
+  const int zoneY   = innerY + segGap;
+  const int zoneW   = innerW - (segGap * 2);
+  const int zoneH   = innerH - (segGap * 2);
+  int maxSegs  = (zoneW + segGap) / segUnit;
+  int fillW    = (total > 0) ? (int)((float)progress / total * (float)zoneW) : 0;
+  int numSegs  = min((int)((fillW + segGap) / segUnit), maxSegs);
+  int segStartX = zoneX;
 
   if (numSegs > lastSegCount) {
     int startSeg = (lastSegCount < 0) ? 0 : lastSegCount;
-    for (int i = startSeg; i < numSegs; i++) {
+    for (int i = startSeg; i < numSegs; i++)
       tft.fillRect(segStartX + i * segUnit, zoneY, segW, zoneH, WIN98_BLUE);
-    }
     lastSegCount = numSegs;
   }
 
-  // --- Time remaining, centered below bar, pushed 6px extra down ---
+  // Time remaining label
   unsigned long remain = (progress < total) ? (total - progress) : 0;
-  int rMin = remain / 60000;
-  int rSec = (remain % 60000) / 1000;
   char remainBuf[10];
-  sprintf(remainBuf, "-%02d:%02d", rMin, rSec);
-
-  int labelY = y + barH + 6 + 10;   // +6px extra push down, +10 for baseline
+  sprintf(remainBuf, "-%02d:%02d", (int)(remain / 60000), (int)((remain % 60000) / 1000));
+  int labelY = y + barH + 6 + 10;
   tft.fillRect(barX, y + barH + 1, barW, 16, WIN98_BG);
-
   int16_t rx1, ry1; uint16_t rw, rh;
   tft.getTextBounds(remainBuf, 0, 0, &rx1, &ry1, &rw, &rh);
   tft.setCursor(barX + (barW - rw) / 2, labelY);
@@ -642,27 +862,22 @@ void drawWin98ProgressBar(unsigned long progress, unsigned long total, int y) {
 }
 
 // ====== Display Now Playing ======
-void displayNowPlaying(bool forceBG, bool forceGUI) {
+void displayNowPlaying(bool /*forceBG*/, bool forceGUI) {
   resetFont();
   static unsigned long lastRetryAttempt = 0;
-  static unsigned long noSongSince = 0;
-  const unsigned long retryInterval   = 5000;
-  const unsigned long brokenLinkDelay = 3000;
-
+  static unsigned long noSongSince      = 0;
+  const unsigned long retryInterval    = 5000;
+  const unsigned long brokenLinkDelay  = 3000;
   unsigned long now = millis();
 
-  bool noSong = !deviceActive ||
-                nowPlaying.track.isEmpty() ||
-                nowPlaying.artist.isEmpty();
+  bool noSong = !deviceActive || nowPlaying.track.isEmpty() || nowPlaying.artist.isEmpty();
 
   if (noSong) {
     if (noSongSince == 0) noSongSince = now;
-
     if (now - lastRetryAttempt > retryInterval) {
       fetchDevices();
       lastRetryAttempt = now;
     }
-
     if ((now - noSongSince > brokenLinkDelay) && !brokenLinkDrawn) {
       drawBrokenLink(0, 0);
       brokenLinkDrawn = true;
@@ -670,25 +885,25 @@ void displayNowPlaying(bool forceBG, bool forceGUI) {
     return;
   }
 
-  // Recovered from broken link
+  // Recovered from broken link / no-song state — force a full window repaint
   if (brokenLinkDrawn || noSongSince != 0) {
     drawWin98WindowFrame("Now Playing");
     brokenLinkDrawn = false;
-    noSongSince = 0;
-    forceGUI = true;
+    noSongSince     = 0;
+    forceGUI        = true;
   }
 
   if (forceGUI) {
     drawWin98WindowFrame("Now Playing");
   }
 
-  bool songChanged = (nowPlaying.track      != lastTrack)  ||
-                     (nowPlaying.artist     != lastArtist) ||
+  bool songChanged = (nowPlaying.track      != lastTrack)    ||
+                     (nowPlaying.artist     != lastArtist)   ||
                      (nowPlaying.duration_ms != lastDuration);
 
-if (songChanged || forceGUI) {
-    resetProgressBar();    // ← fix: reset bar on song change
-    lastProgress = 0;      // ← fix: force immediate bar redraw
+  if (songChanged || forceGUI) {
+    resetProgressBar();
+    lastProgress = 0;
 
     const int rectWidth  = 164;
     const int rectHeight = 141;
@@ -696,37 +911,28 @@ if (songChanged || forceGUI) {
     int rectY = BASE_TITLE_Y;
     tft.fillRect(rectX, rectY, rectWidth, rectHeight, WIN98_BG);
 
-    // ── TITLE ──────────────────────────────────────────────────────────────
-    // BASE_TITLE_Y + 10 was the original. +14 moves it 4px lower.
-    // wrapText(..., 22) allows 4 more chars than the old 18 (was already 20,
-    // so bump to 22 for 4 more than the previous 18 baseline).
+    // Title
     int y = BASE_TITLE_Y + 18;
     tft.setFont(&micross7pt7b);
     tft.setTextSize(1);
-
-    auto trackLines = wrapText(nowPlaying.track, 22); // 22 = 4 more than old 18
+    auto trackLines = wrapText(nowPlaying.track, 22);
     for (auto& line : trackLines) {
-      String t = line;
       int16_t x1, y1; uint16_t w, h;
-      tft.getTextBounds(t.c_str(), 0, 0, &x1, &y1, &w, &h);
+      tft.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h);
       int16_t drawX = (DISP_W - (int16_t)w) / 2 - x1;
-      int16_t drawY = y - y1;           // correct for GFX baseline offset
-      // Pseudo-bold: draw twice 1px apart — thickens strokes without a bold font file
+      int16_t drawY = y - y1;
       tft.setTextColor(WIN98_TEXT, WIN98_BG);
-      tft.setCursor(drawX,     drawY); tft.print(t);
-      tft.setCursor(drawX + 1, drawY); tft.print(t);
+      tft.setCursor(drawX,     drawY); tft.print(line);
+      tft.setCursor(drawX + 1, drawY); tft.print(line);  // pseudo-bold
       y += h + 3;
     }
 
-    // ── ARTIST ─────────────────────────────────────────────────────────────
-    // rectY + 48 instead of +44 = 4px lower.
-    // WIN98_TEXT = 0x0000 = black (changed from WIN98_WHITE which was white).
-    // wrapText(..., 22) = same 4-extra-char budget as title.
+    // Artist
     int textY = y + 3;
-    auto artistLines = wrapText(nowPlaying.artist, 26); // 22 = 4 more than old 18
+    auto artistLines = wrapText(nowPlaying.artist, 26);
     for (auto& line : artistLines) {
       drawCenteredText(DISP_W / 2, textY, line.c_str(), WIN98_TEXT, WIN98_BG);
-      textY += getTextHeight()+ 4;
+      textY += getTextHeight() + 4;
     }
 
     lastTrack    = nowPlaying.track;
@@ -739,9 +945,10 @@ if (songChanged || forceGUI) {
     drawWin98ProgressBar(nowPlaying.progress_ms, nowPlaying.duration_ms, progressY);
     lastProgress = nowPlaying.progress_ms;
   }
-}  // ← closes displayNowPlaying — THIS BRACE WAS MISSING
+}
+
 // ====== Playlist Menu ======
-void drawPlaylistMenu(bool fullRedraw = true, int prevIndex = -1, int newIndex = -1) {
+void drawPlaylistMenu(bool fullRedraw, int prevIndex, int newIndex) {
   resetFont();
   const int outerMarginX  = 40;
   const int startY        = 66;
@@ -751,34 +958,33 @@ void drawPlaylistMenu(bool fullRedraw = true, int prevIndex = -1, int newIndex =
   const int buttonWidth   = DISP_W - outerMarginX * 2;
 
   static int lastFirstVisible = -1;
-
   int firstVisible = selectedIndex - (visibleItems - 1);
   if (firstVisible < 0) firstVisible = 0;
   if (firstVisible > NUM_PLAYLISTS - visibleItems)
     firstVisible = NUM_PLAYLISTS - visibleItems;
 
   if (firstVisible != lastFirstVisible) {
-    fullRedraw = true;
+    fullRedraw       = true;
     lastFirstVisible = firstVisible;
   }
 
   if (fullRedraw) {
     int y = startY;
     for (int i = firstVisible; i < firstVisible + visibleItems && i < NUM_PLAYLISTS; i++) {
-      bool    pressed = (i == selectedIndex);
-      uint16_t bg     = pressed ? WIN98_GRAY : WIN98_BG;
+      bool    pressed  = (i == selectedIndex);
+      uint16_t bg      = pressed ? WIN98_GRAY : WIN98_BG;
       uint16_t textCol = pressed ? WIN98_WHITE : WIN98_TEXT;
       drawWin98ButtonEx(outerMarginX, y, buttonWidth, buttonHeight,
                         playlists[i].name.c_str(), bg, textCol, pressed);
       y += buttonHeight + buttonSpacing;
     }
   } else {
-    if (prevIndex >= 0 && prevIndex >= firstVisible && prevIndex < firstVisible + visibleItems) {
+    if (prevIndex >= firstVisible && prevIndex < firstVisible + visibleItems) {
       int y = startY + (prevIndex - firstVisible) * (buttonHeight + buttonSpacing);
       drawWin98ButtonEx(outerMarginX, y, buttonWidth, buttonHeight,
                         playlists[prevIndex].name.c_str(), WIN98_BG, WIN98_TEXT, false);
     }
-    if (newIndex >= 0 && newIndex >= firstVisible && newIndex < firstVisible + visibleItems) {
+    if (newIndex >= firstVisible && newIndex < firstVisible + visibleItems) {
       int y = startY + (newIndex - firstVisible) * (buttonHeight + buttonSpacing);
       drawWin98ButtonEx(outerMarginX, y, buttonWidth, buttonHeight,
                         playlists[newIndex].name.c_str(), WIN98_GRAY, WIN98_WHITE, true);
@@ -788,79 +994,83 @@ void drawPlaylistMenu(bool fullRedraw = true, int prevIndex = -1, int newIndex =
 
 // ====== Buttons ======
 void checkButtons(unsigned long now) {
-  if (!brokenLinkDrawn) {
-    bool currPV   = digitalRead(BTN_PV);
-    bool currNV   = digitalRead(BTN_NV);
-    bool currPlay = digitalRead(BTN_PLAY);
-    bool currMode = digitalRead(BTN_MODE);
+  if (brokenLinkDrawn) return;  // ignore buttons while error dialog is showing
 
-    if (inMenu) {
-      if (prevPVState == HIGH && currPV == LOW && now - lastPVAction > DEBOUNCE_MS) {
-        int prev = selectedIndex;
-        selectedIndex = (selectedIndex - 1 + NUM_PLAYLISTS) % NUM_PLAYLISTS;
-        drawPlaylistMenu(false, prev, selectedIndex);
-        lastPVAction = now;
-      }
-      if (prevNVState == HIGH && currNV == LOW && now - lastNVAction > DEBOUNCE_MS) {
-        int prev = selectedIndex;
-        selectedIndex = (selectedIndex + 1) % NUM_PLAYLISTS;
-        drawPlaylistMenu(false, prev, selectedIndex);
-        lastNVAction = now;
-      }
-      if (prevPlayState == HIGH && currPlay == LOW && now - lastPlayAction > DEBOUNCE_MS) {
-        playPlaylist(playlists[selectedIndex].uri);
-        inMenu = false;
-        firstNowPlayingDraw = true;  // force full BG+GUI repaint
-        // Force BG + GUI repaint when returning to Now Playing
-        tft.fillScreen(0x0000);
-        resetFont();
-        drawWin98CloudsBG();
-        lastTrack = "";   // force song text redraw
-        lastProgress = 0;
-        resetProgressBar();
-        lastPlayAction = now;
-      }
-      if (prevModeState == HIGH && currMode == LOW && now - lastModeAction > DEBOUNCE_MS) {
-        inMenu = false;
-        firstNowPlayingDraw = true;  // force full BG+GUI repaint
-        tft.fillScreen(0x0000);
-        resetFont();
-        drawWin98CloudsBG();
-        lastTrack = "";   // force song text redraw
-        resetProgressBar();
-        lastProgress = 0;
-        lastModeAction = now;
-      }
-    } else {
-      if (prevPVState == HIGH && currPV == LOW && now - lastPVAction > DEBOUNCE_MS) {
-        previousTrack();
-        resetProgressBar();
-lastProgress = 0;
-        lastPVAction = now;
-      }
-      if (prevNVState == HIGH && currNV == LOW && now - lastNVAction > DEBOUNCE_MS) {
-        nextTrack();
-        resetProgressBar();
-lastProgress = 0;
-        lastNVAction = now;
-      }
-      if (prevPlayState == HIGH && currPlay == LOW && now - lastPlayAction > DEBOUNCE_MS) {
-        togglePlayPause();
-        lastPlayAction = now;
-      }
-      if (prevModeState == HIGH && currMode == LOW && now - lastModeAction > DEBOUNCE_MS) {
-        inMenu = true;
-        selectedIndex = 0;
-        resetFont();
-        drawWin98WindowFrame("Playlists");
-        drawPlaylistMenu(true);
-        lastModeAction = now;
-      }
+  bool currPV   = digitalRead(BTN_PV);
+  bool currNV   = digitalRead(BTN_NV);
+  bool currPlay = digitalRead(BTN_PLAY);
+  bool currMode = digitalRead(BTN_MODE);
+
+  if (inMenu) {
+    // ── Navigate up ──────────────────────────────────────────────────────
+    if (prevPVState == HIGH && currPV == LOW && now - lastPVAction > DEBOUNCE_MS) {
+      int prev = selectedIndex;
+      selectedIndex = (selectedIndex - 1 + NUM_PLAYLISTS) % NUM_PLAYLISTS;
+      drawPlaylistMenu(false, prev, selectedIndex);
+      lastPVAction = now;
+    }
+    // ── Navigate down ─────────────────────────────────────────────────────
+    if (prevNVState == HIGH && currNV == LOW && now - lastNVAction > DEBOUNCE_MS) {
+      int prev = selectedIndex;
+      selectedIndex = (selectedIndex + 1) % NUM_PLAYLISTS;
+      drawPlaylistMenu(false, prev, selectedIndex);
+      lastNVAction = now;
+    }
+    // ── Select playlist ───────────────────────────────────────────────────
+    // Exit menu → Now Playing.  drawWin98WindowFrame in firstNowPlayingDraw
+    // will repaint the window area; clouds are never touched.
+    if (prevPlayState == HIGH && currPlay == LOW && now - lastPlayAction > DEBOUNCE_MS) {
+      playPlaylist(playlists[selectedIndex].uri);
+      inMenu              = false;
+      firstNowPlayingDraw = true;
+      lastTrack           = "";    // force text redraw
+      lastProgress        = 0;
+      resetProgressBar();
+      lastPlayAction = now;
+    }
+    // ── Cancel / back ─────────────────────────────────────────────────────
+    if (prevModeState == HIGH && currMode == LOW && now - lastModeAction > DEBOUNCE_MS) {
+      inMenu              = false;
+      firstNowPlayingDraw = true;
+      lastTrack           = "";
+      lastProgress        = 0;
+      resetProgressBar();
+      lastModeAction = now;
     }
 
-    prevPVState   = currPV;
-    prevNVState   = currNV;
-    prevPlayState = currPlay;
-    prevModeState = currMode;
+  } else {
+    // ── Previous track ────────────────────────────────────────────────────
+    if (prevPVState == HIGH && currPV == LOW && now - lastPVAction > DEBOUNCE_MS) {
+      previousTrack();
+      resetProgressBar();
+      lastProgress = 0;
+      lastPVAction = now;
+    }
+    // ── Next track ────────────────────────────────────────────────────────
+    if (prevNVState == HIGH && currNV == LOW && now - lastNVAction > DEBOUNCE_MS) {
+      nextTrack();
+      resetProgressBar();
+      lastProgress = 0;
+      lastNVAction = now;
+    }
+    // ── Play / Pause ──────────────────────────────────────────────────────
+    if (prevPlayState == HIGH && currPlay == LOW && now - lastPlayAction > DEBOUNCE_MS) {
+      togglePlayPause();
+      lastPlayAction = now;
+    }
+    // ── Open playlist menu ────────────────────────────────────────────────
+    if (prevModeState == HIGH && currMode == LOW && now - lastModeAction > DEBOUNCE_MS) {
+      inMenu        = true;
+      selectedIndex = 0;
+      resetFont();
+      drawWin98WindowFrame("Playlists");
+      drawPlaylistMenu(true, -1, 0);
+      lastModeAction = now;
+    }
   }
+
+  prevPVState   = currPV;
+  prevNVState   = currNV;
+  prevPlayState = currPlay;
+  prevModeState = currMode;
 }
