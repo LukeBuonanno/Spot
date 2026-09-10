@@ -511,15 +511,29 @@ void loop() {
   }
 
   // ── Device heartbeat ────────────────────────────────────────────────────
-  if (!deviceActive && now - lastDeviceAttempt > deviceRetryInterval) {
+  // Keep polling even while a device is currently active. Spotify can go from
+  // an active session to no active session without changing WiFi state, so we
+  // must re-check /me/player/devices periodically to detect that transition.
+  if (now - lastDeviceAttempt > deviceRetryInterval) {
+    bool wasDeviceActive = deviceActive;
+
     fetchDevices();
     lastDeviceAttempt = now;
-    if (!deviceActive && !brokenLinkDrawn) {
-      drawBrokenLink(0, 0);
-      brokenLinkDrawn = true;
+
+    if (!deviceActive) {
+      // No active Spotify session: show the error exactly once.
+      if (!brokenLinkDrawn) {
+        drawBrokenLink(0, 0);
+        brokenLinkDrawn = true;
+      }
+    } else if (!wasDeviceActive) {
+      // Spotify session returned: fetch the current track before drawing the
+      // normal UI so we do not flash an empty Now Playing screen.
+      brokenLinkDrawn = false;
+      fetchNowPlaying();
+      lastNowPlaying = now;
+      firstNowPlayingDraw = true;
     }
-  } else if (deviceActive) {
-    brokenLinkDrawn = false;
   }
 
   checkButtons(now);
@@ -565,26 +579,51 @@ bool refreshAccessToken() {
 
 void fetchDevices() {
   if (accessToken == "") return;
+
   HTTPClient http;
   http.begin(String(spotifyAPI) + "/me/player/devices");
   http.addHeader("Authorization", "Bearer " + accessToken);
+
   int code = http.GET();
   bool found = false;
+  String foundDeviceId = "";
+
   if (code == 200) {
     DynamicJsonDocument doc(8192);
     deserializeJson(doc, http.getString());
     JsonArray devices = doc["devices"].as<JsonArray>();
-    if (devices.size() > 0) {
-      activeDeviceId = devices[0]["id"].as<String>();
-      Serial.println("Active Device: " + activeDeviceId);
-      found = true;
-    } else {
+
+    // /me/player/devices returns available Connect devices, not necessarily
+    // the device with the current Spotify session. Only is_active=true should
+    // count as an active session for this controller.
+    for (JsonObject device : devices) {
+      if (device["is_active"] == true) {
+        foundDeviceId = device["id"].as<String>();
+        Serial.println("Active Device: " + foundDeviceId);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
       Serial.println("No active Spotify devices found!");
     }
   } else {
     Serial.printf("fetchDevices() failed: %d\n", code);
   }
+
   deviceActive = found;
+  if (found) {
+    activeDeviceId = foundDeviceId;
+  } else {
+    activeDeviceId = "";
+    nowPlaying.track = "";
+    nowPlaying.artist = "";
+    nowPlaying.progress_ms = 0;
+    nowPlaying.duration_ms = 0;
+    nowPlaying.isPlaying = false;
+  }
+
   http.end();
 }
 
@@ -873,6 +912,16 @@ void displayNowPlaying(bool /*forceBG*/, bool forceGUI) {
   bool noSong = !deviceActive || nowPlaying.track.isEmpty() || nowPlaying.artist.isEmpty();
 
   if (noSong) {
+    // No active playback is a normal Spotify state, not an error.
+    // If Spotify has a device/session but nothing is playing, leave the
+    // existing UI alone and wait for the next now-playing poll.
+    if (deviceActive) {
+      noSongSince = 0;
+      return;
+    }
+
+    // No Spotify device/session at all: retry periodically, but only draw
+    // the error dialog once until the device/session comes back.
     if (noSongSince == 0) noSongSince = now;
     if (now - lastRetryAttempt > retryInterval) {
       fetchDevices();
@@ -1074,3 +1123,4 @@ void checkButtons(unsigned long now) {
   prevPlayState = currPlay;
   prevModeState = currMode;
 }
+
