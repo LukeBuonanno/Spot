@@ -146,34 +146,6 @@ String refreshToken = "YOUR_REFRESH_TOKEN";
 
 
 
-
-## WiFi Setup
-
-Update:
-
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
-
-
-## Captive Portal (Important)
-
-This code includes automatic login for a network portal.
-
-If you are not using that network:
-
-Remove or comment out:
-
-
-authenticateCaptivePortal();
-
-
-Or replace:
-
-
-const char* portalUser = "...";
-const char* portalPass = "...";
-
-
 ## Uploading the Code
 
 1. Connect ESP32-S3 via USB
@@ -183,6 +155,16 @@ const char* portalPass = "...";
 If upload fails:
 
 * Hold the BOOT button while uploading
+
+## WiFi Setup
+On first boot, the device creates a WiFi network:
+Spotify-Controller-Setup
+
+Join that network from your phone or laptop
+Open: http://192.168.4.1
+
+Input your WiFi name + password
+Click Save and connect!
 
 
 ## Controls
