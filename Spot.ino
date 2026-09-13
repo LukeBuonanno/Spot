@@ -40,9 +40,9 @@ const unsigned long WIFI_RETRY_DELAY_MS = 1000;
 const unsigned long WIFI_RETRY_MS = 5000;
 
 // ====== Spotify ======
-String clientId     = "e6d99f1a36c74c1595f5f7fe87684a7b";
-String clientSecret = "05167e57acfe488a97f4ec3b64996884";
-String refreshToken = "AQCkgbv56lSaRur27DkGQwChm1gRyDxWEiadPKF3x_pwHTo41-p9cUWxOO6_RERDv3ZNRssJLh3JYnUG_ZgL3ZxZumvW-nmdbU9uEzwuhnSIeONJCzBZfj4KW6nBpJkcgvE";
+String clientId     = "CHANGEME";
+String clientSecret = "CHANGEME";
+String refreshToken = "CHANGEME";
 String accessToken  = "";
 String activeDeviceId = "";
 bool isPaused  = false;
@@ -68,16 +68,10 @@ unsigned long lastPlayAction = 0, lastModeAction = 0;
 // ====== Playlist ======
 struct Playlist { String name; String uri; };
 Playlist playlists[] = {
-  {"indiego",       "spotify:playlist:3R3mMn3msfsfs8ey4EaGUb"},
-  {"survival",      "spotify:playlist:0FYKAgZQM31hGglkIItiUU"},
-  {"lonely",        "spotify:playlist:6j6fOIg2z7cqMv12SPMPqZ"},
-  {"time flies",    "spotify:playlist:7wj40DOgzi9xorAe3cNLXB"},
-  {"fuzz",          "spotify:playlist:4YMFm3W7JYG3XOnhIO7kdM"},
-  {"voltaic shock", "spotify:playlist:5qZljELpGYWBY4D9v9l774"},
-  {"yearn",         "spotify:playlist:2QHOADq6rmn2PPwsSNQBlO"},
-  {"itch",          "spotify:playlist:4LtoZ8u9sYSdjNL2ZoFtvY"},
-  {"romance",       "spotify:playlist:1oY4P7qPiq7hlChStBbYGo"},
-  {"rap",           "spotify:playlist:0bJJL7upzuv9BGoAdKbZPU"}
+  {"CHANGEME (name)",       "spotify:playlist:CHANGEME"},
+{"CHANGEME (name)",       "spotify:playlist:CHANGEME"},
+{"CHANGEME (name)",       "spotify:playlist:CHANGEME"},
+{"CHANGEME (name)",       "spotify:playlist:CHANGEME"}
 };
 const int NUM_PLAYLISTS = sizeof(playlists) / sizeof(playlists[0]);
 
