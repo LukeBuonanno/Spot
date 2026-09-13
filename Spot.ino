@@ -31,12 +31,18 @@ bool wifiAttemptInProgress = false;
 bool wifiWasConnected = false;
 bool portalStarted = false;
 unsigned long lastWifiRetry = 0;
+
+// How long to let one WiFi.begin() attempt run before restarting it.
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+
+// Small delay between failed attempts.
+const unsigned long WIFI_RETRY_DELAY_MS = 1000;
 const unsigned long WIFI_RETRY_MS = 5000;
 
 // ====== Spotify ======
-String clientId     = "changeme";
-String clientSecret = "changeme";
-String refreshToken = "changeme";
+String clientId     = "e6d99f1a36c74c1595f5f7fe87684a7b";
+String clientSecret = "05167e57acfe488a97f4ec3b64996884";
+String refreshToken = "AQCkgbv56lSaRur27DkGQwChm1gRyDxWEiadPKF3x_pwHTo41-p9cUWxOO6_RERDv3ZNRssJLh3JYnUG_ZgL3ZxZumvW-nmdbU9uEzwuhnSIeONJCzBZfj4KW6nBpJkcgvE";
 String accessToken  = "";
 String activeDeviceId = "";
 bool isPaused  = false;
@@ -62,11 +68,16 @@ unsigned long lastPlayAction = 0, lastModeAction = 0;
 // ====== Playlist ======
 struct Playlist { String name; String uri; };
 Playlist playlists[] = {
-{"changeme (name)",      "spotify:playlist:changeme"},
-{"changeme (name)",      "spotify:playlist:changeme"},
-{"changeme (name)",      "spotify:playlist:changeme"},
-{"changeme (name)",      "spotify:playlist:changemeETC"}
-
+  {"indiego",       "spotify:playlist:3R3mMn3msfsfs8ey4EaGUb"},
+  {"survival",      "spotify:playlist:0FYKAgZQM31hGglkIItiUU"},
+  {"lonely",        "spotify:playlist:6j6fOIg2z7cqMv12SPMPqZ"},
+  {"time flies",    "spotify:playlist:7wj40DOgzi9xorAe3cNLXB"},
+  {"fuzz",          "spotify:playlist:4YMFm3W7JYG3XOnhIO7kdM"},
+  {"voltaic shock", "spotify:playlist:5qZljELpGYWBY4D9v9l774"},
+  {"yearn",         "spotify:playlist:2QHOADq6rmn2PPwsSNQBlO"},
+  {"itch",          "spotify:playlist:4LtoZ8u9sYSdjNL2ZoFtvY"},
+  {"romance",       "spotify:playlist:1oY4P7qPiq7hlChStBbYGo"},
+  {"rap",           "spotify:playlist:0bJJL7upzuv9BGoAdKbZPU"}
 };
 const int NUM_PLAYLISTS = sizeof(playlists) / sizeof(playlists[0]);
 
@@ -364,15 +375,27 @@ void stopWiFiSetupPortal() {
 void attemptWiFiConnection() {
   if (savedSSID.length() == 0) {
     Serial.println("No saved WiFi credentials. Waiting for setup portal.");
+    wifiAttemptInProgress = false;
+    return;
+  }
+
+  // Never call WiFi.begin() while another connection attempt is active.
+  if (wifiAttemptInProgress) {
     return;
   }
 
   Serial.println("Trying WiFi: " + savedSSID);
+
+  // Make sure we're in AP+STA mode so the setup portal stays alive.
   WiFi.mode(WIFI_AP_STA);
+
+  // Start exactly one connection attempt.
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+
   wifiAttemptInProgress = true;
   lastWifiRetry = millis();
 }
+
 
 void handleWiFiConnection() {
   unsigned long now = millis();
@@ -382,25 +405,48 @@ void handleWiFiConnection() {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
       wifiAttemptInProgress = false;
+
       Serial.println("WiFi connected: " + WiFi.localIP().toString());
+
+      // Connection succeeded, so the setup AP is no longer needed.
       stopWiFiSetupPortal();
+
       appState = APP_SPOTIFY_INIT;
       lastSpotifyRetry = 0;
     }
+
     return;
+  }
+
+  if (wifiAttemptInProgress &&
+      now - lastWifiRetry >= WIFI_CONNECT_TIMEOUT_MS) {
+
+    Serial.println("WiFi connection timed out. Retrying...");
+
+    // Abort the current STA connection cleanly.
+    WiFi.disconnect(false, false);
+
+    wifiAttemptInProgress = false;
+    lastWifiRetry = now;
   }
 
   if (wifiWasConnected) {
     Serial.println("WiFi connection lost. Restarting setup portal and retrying.");
+
     wifiWasConnected = false;
     wifiAttemptInProgress = false;
+
     appState = APP_WIFI_CONNECTING;
     lastDrawnAppState = (AppState)(-1);
+
     startWiFiSetupPortal();
+
+    return;
   }
 
-  if (!wifiAttemptInProgress || now - lastWifiRetry >= WIFI_RETRY_MS) {
-    // Do NOT erase stored credentials. WiFi can simply be down temporarily.
+  if (!wifiAttemptInProgress &&
+      now - lastWifiRetry >= WIFI_RETRY_DELAY_MS) {
+
     attemptWiFiConnection();
   }
 }
@@ -1123,4 +1169,3 @@ void checkButtons(unsigned long now) {
   prevPlayState = currPlay;
   prevModeState = currMode;
 }
-
